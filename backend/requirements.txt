@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+scikit-learn
+xgboost
+pandas
+joblib
+pyppeteer
+aiohttp
+beautifulsoup4
+lxml
