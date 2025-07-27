@@ -82,35 +82,6 @@ class NhatotRealEstateCrawler:
             print(f"❌ Lỗi tải trang {page_num}: {e}")
             return False
     
-    async def wait_for_content(self):
-        """Chờ content load"""
-        try:
-            # Thử nhiều selectors khác nhau
-            selectors = [
-                'div[class*="AdItem"]',
-                'a[class*="AdItem"]', 
-                'div[class*="ad-item"]',
-                'div[data-testid*="ad"]',
-                'div[class*="Item"]',
-                'a[href*="/bat-dong-san"]',
-                '.list-item',
-                '[class*="listing"]'
-            ]
-            
-            for selector in selectors:
-                try:
-                    await self.page.waitForSelector(selector, {'timeout': 3000})
-                    print(f"✅ Content đã load với selector: {selector}")
-                    return True
-                except:
-                    continue
-            
-            print("⚠️ Không tìm thấy content với selectors thông thường, tiếp tục anyway...")
-            return True  # Tiếp tục crawl dù không tìm thấy specific selectors
-        except Exception as e:
-            print(f"⚠️ Lỗi chờ content: {e}")
-            return True  # Vẫn tiếp tục
-    
     async def get_page_content(self) -> str:
         """Lấy HTML content của trang"""
         try:
@@ -119,48 +90,6 @@ class NhatotRealEstateCrawler:
         except Exception as e:
             print(f"❌ Lỗi lấy content: {e}")
             return ""
-    
-    async def check_page_exists(self, page_num: int) -> bool:
-        """Kiểm tra trang có tồn tại không (có data)"""
-        try:
-            # Kiểm tra page có còn live không
-            if self.page.isClosed():
-                print(f"⚠️ Page đã bị đóng tại trang {page_num}")
-                return False
-                
-            # Đếm số lượng items trên trang với nhiều selectors
-            items_count = await self.page.evaluate('''() => {
-                const selectors = [
-                    'div[class*="AdItem"]',
-                    'a[class*="AdItem"]', 
-                    'div[class*="ad-item"]',
-                    'div[data-testid*="ad"]',
-                    'div[class*="Item"]',
-                    'a[href*="/bat-dong-san"]',
-                    '.list-item',
-                    '[class*="listing"]',
-                    'div[class*="item"]',
-                    'article',
-                    '[class*="property"]'
-                ];
-                
-                let maxCount = 0;
-                for (const selector of selectors) {
-                    try {
-                        const items = document.querySelectorAll(selector);
-                        maxCount = Math.max(maxCount, items.length);
-                    } catch (e) {
-                        continue;
-                    }
-                }
-                return maxCount;
-            }''')
-            
-            print(f"📊 Trang {page_num}: Tìm thấy {items_count} items")
-            return items_count > 0
-        except Exception as e:
-            print(f"❌ Lỗi kiểm tra trang {page_num}: {e}")
-            return False
     
     def extract_property_data(self, html_content: str, page_num: int) -> List[Dict[str, Any]]:
         """
@@ -207,10 +136,11 @@ class NhatotRealEstateCrawler:
         return properties
     
     def _extract_single_property(self, item, page_num: int, item_idx: int) -> Dict[str, Any]:
-        """Extract thông tin từ một item bất động sản theo cấu trúc HTML mới sử dụng nth selectors"""
+        """Extract thông tin từ một item bất động sản sử dụng nth-child selectors"""
         property_data = {
             'title': '',
             'price': '',
+            'price_unit': '',
             'area': '',
             'location': '',
             'description': '',
@@ -231,66 +161,56 @@ class NhatotRealEstateCrawler:
             # Fallback: tìm trong chính item
             li_element = item
         
-        # Tìm div chính chứa content (thường là div thứ 2 trong structure)
+        # Tìm main content div - là div thứ 2 trong a[itemprop="item"]
         main_content_div = li_element.select_one('a[itemprop="item"] > div:nth-child(2)')
         if not main_content_div:
-            # Fallback: tìm div có chứa h3
-            main_content_div = li_element.find('div', lambda value: value and li_element.find('h3'))
-            if not main_content_div:
-                main_content_div = li_element
+            print(f"⚠️ Không tìm thấy main content div cho item {item_idx}")
+            return property_data
         
-        # Title - tìm h3 (thường là element đầu tiên trong content)
-        title_elem = main_content_div.find('h3')
-        if title_elem:
+        # Title - tìm h3 (element thứ 2 trong main content div)
+        title_elem = main_content_div.select_one('h3')
+        
+        if title_elem and title_elem.name == 'h3':
             property_data['title'] = title_elem.get_text(strip=True)
         
-        # Property type - tìm span đầu tiên sau h3
-        spans_in_content = main_content_div.find_all('span', recursive=False)
-        if len(spans_in_content) >= 1:
-            type_text = spans_in_content[0].get_text(strip=True)
+        # Property type - tìm span thứ 3 trong main content div
+        property_type_elem = main_content_div.select_one(':nth-child(3)')
+        if property_type_elem and property_type_elem.name == 'span':
+            type_text = property_type_elem.get_text(strip=True)
+            print("type_text", type_text)
             property_data['property_type'] = type_text
-            # Extract bedrooms/bathrooms nếu có trong text
-            if 'phòng ngủ' in type_text.lower():
-                bedrooms_match = re.search(r'(\d+)\s*phòng ngủ', type_text, re.I)
-                if bedrooms_match:
-                    property_data['bedrooms'] = bedrooms_match.group(1)
-            if 'phòng tắm' in type_text.lower() or 'wc' in type_text.lower():
-                bathrooms_match = re.search(r'(\d+)\s*(?:phòng tắm|wc)', type_text, re.I)
-                if bathrooms_match:
-                    property_data['bathrooms'] = bathrooms_match.group(1)
-        
-        # Price và Area - tìm div chứa price info (thường là div thứ 2-3 trong content)
-        price_div = main_content_div.find('div', lambda value: value and main_content_div.find('div').find_all('span'))
-        
-        if price_div:
+            # Tách và xử lý thông tin từ type_text
+            if type_text:
+                parts = [part.strip() for part in type_text.split('•')]
+                for part in parts:
+                    # Xử lý số phòng ngủ
+                    if 'PN' in part:
+                        bedrooms = re.search(r'(\d+)\s*PN', part)
+                        if bedrooms:
+                            property_data['bedrooms'] = bedrooms.group(1)
+                    
+                    # Xử lý hướng nhà
+                    elif any(direction in part for direction in ['Nam', 'Bắc', 'Đông', 'Tây']):
+                        property_data['direction'] = part.replace('Hướng ', '')
+                    
+                    # Xử lý loại nhà
+                    else:
+                        property_data['property_type'] = part
+        # Price và Area - tìm div thứ 4 trong main content div (chứa price info)
+        price_div = main_content_div.select_one(':nth-child(4)')
+        if price_div and price_div.name == 'div':
+            # Tìm tất cả span trong price div
             price_spans = price_div.find_all('span')
-            for i, span in enumerate(price_spans):
-                text = span.get_text(strip=True)
-                style = span.get('style', '')
-                
-                # Price - thường là span đầu tiên hoặc span có màu đỏ
-                if not property_data['price'] and (
-                    i == 0 or 
-                    'rgb(229, 25, 59)' in style or 
-                    any(keyword in text.lower() for keyword in ['tỷ', 'triệu', 'đồng', 'vnd'])
-                ):
-                    property_data['price'] = text
-                
-                # Area - tìm span chứa m²
-                if not property_data['area'] and ('m²' in text or 'm2' in text):
-                    property_data['area'] = text
-        
-        # Location và posted date - tìm span cuối cùng trong content (thường chứa location • date)
-        location_span = None
-        all_spans = main_content_div.find_all('span')
-        # Tìm span cuối cùng có chứa dấu •
-        for span in reversed(all_spans):
-            if '•' in span.get_text():
-                location_span = span
-                break
-        
-        if location_span:
-            location_text = location_span.get_text(strip=True)
+            print("price_spans", price_spans)
+            property_data['price'] = price_spans[0].get_text(strip=True)
+            property_data['price_unit'] = price_spans[1].get_text(strip=True)
+            property_data['area'] = price_spans[2].get_text(strip=True)
+        # Location và posted date - tìm span thứ 5 trong main content div
+        location_elem = main_content_div.find_all('span', recursive=False)[1]
+        print("location_elem", location_elem)
+        if location_elem and location_elem.name == 'span':
+            location_text = location_elem.get_text(strip=True)
+            print("location_text", location_text)
             # Split by • để tách location và date
             parts = [part.strip() for part in location_text.split('•')]
             if len(parts) >= 1:
@@ -312,12 +232,13 @@ class NhatotRealEstateCrawler:
             else:
                 property_data['url'] = href
         
-        # Image URL - tìm img đầu tiên
+        # Image URL - tìm img đầu tiên trong li_element
         img_elem = li_element.find('img', src=True)
         if img_elem:
             src = img_elem.get('src', '')
             alt = img_elem.get('alt', '')
-            # Sử dụng alt làm description nếu có
+            
+            # Sử dụng alt làm description nếu chưa có description
             if alt and not property_data.get('description'):
                 property_data['description'] = alt
                 
@@ -376,15 +297,7 @@ class NhatotRealEstateCrawler:
                 if not await self.navigate_to_page(base_url, page_num):
                     print(f"❌ Không thể tải trang {page_num}, bỏ qua...")
                     continue
-                
-                # Chờ content load
-                await self.wait_for_content()
-                
-                # Kiểm tra trang có data không
-                if not await self.check_page_exists(page_num):
-                    print(f"⚠️ Trang {page_num} không có dữ liệu, dừng crawl")
-                    break
-                
+
                 # Lấy HTML content
                 html_content = await self.get_page_content()
                 
