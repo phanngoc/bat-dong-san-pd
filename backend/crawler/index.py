@@ -178,55 +178,19 @@ class NhatotRealEstateCrawler:
         soup = BeautifulSoup(html_content, 'lxml')
         properties = []
         
-        # Tìm các item bất động sản với nhiều selector khác nhau
-        selectors = [
-            'div[class*="AdItem_adItem"]',
-            'div[class*="AdItem"]', 
-            'a[class*="AdItem"]',
-            'div[class*="ad-item"]',
-            'div[data-testid*="ad"]',
-            'div[class*="Item"]',
-            'a[href*="/bat-dong-san"]',
-            '.list-item',
-            '[class*="listing"]',
-            'div[class*="item"]',
-            'article',
-            '[class*="property"]',
-            'div[class*="card"]',
-            'li[class*="item"]'
-        ]
+        # Tìm container chính theo cấu trúc: div.list-view>div>div.ListAds_ListAds__ANK2d>ul>div
+        main_container = soup.select_one('div.list-view div div.ListAds_ListAds__ANK2d ul')
         
-        property_items = []
-        for selector in selectors:
-            items = soup.select(selector)
-            if items:
-                property_items = items
-                print(f"✅ Sử dụng selector: {selector}")
-                break
+        if not main_container:
+            print("⚠️ Không tìm thấy container chính với selector div.ListAds_ListAds__ANK2d")
+        else:
+            # Tìm các div items trong container
+            property_items = main_container.find_all('div', recursive=False)
+            print(f"✅ Tìm thấy container chính, có {len(property_items)} items")
         
         if not property_items:
-            # Fallback 1: tìm tất cả links có href chứa bat-dong-san
-            property_items = soup.find_all('a', href=re.compile(r'.*bat-dong-san.*', re.I))
-            if property_items:
-                print("✅ Sử dụng fallback: links chứa 'bat-dong-san'")
-            
-        if not property_items:
-            # Fallback 2: tìm tất cả divs có chứa text giá tiền
-            property_items = soup.find_all('div', string=re.compile(r'.*tỷ.*|.*triệu.*|.*million.*', re.I))
-            if property_items:
-                print("✅ Sử dụng fallback: divs chứa giá tiền")
-                
-        if not property_items:
-            # Fallback 3: tìm tất cả articles
-            property_items = soup.find_all('article')
-            if property_items:
-                print("✅ Sử dụng fallback: article tags")
-                
-        if not property_items:
-            # Fallback 4: tìm tất cả divs có class chứa 'item' hoặc 'card'
-            property_items = soup.find_all('div', class_=re.compile(r'.*item.*|.*card.*', re.I))
-            if property_items:
-                print("✅ Sử dụng fallback: divs với class item/card")
+            print("⚠️ Không tìm thấy items nào")
+            return properties
             
         print(f"🏠 Tìm thấy {len(property_items)} bất động sản trên trang {page_num}")
         
@@ -243,7 +207,7 @@ class NhatotRealEstateCrawler:
         return properties
     
     def _extract_single_property(self, item, page_num: int, item_idx: int) -> Dict[str, Any]:
-        """Extract thông tin từ một item bất động sản"""
+        """Extract thông tin từ một item bất động sản theo cấu trúc HTML mới sử dụng nth selectors"""
         property_data = {
             'title': '',
             'price': '',
@@ -261,68 +225,86 @@ class NhatotRealEstateCrawler:
             'scraped_at': datetime.now().isoformat()
         }
         
-        # Tìm parent container nếu cần
-        container = item
-        for _ in range(3):  # Tìm trong 3 level parent
-            parent = container.parent if container.parent else container
-            if parent.find('a', href=True):
-                container = parent
+        # Tìm li element chứa itemListElement
+        li_element = item.find('li', {'itemprop': 'itemListElement'})
+        if not li_element:
+            # Fallback: tìm trong chính item
+            li_element = item
+        
+        # Tìm div chính chứa content (thường là div thứ 2 trong structure)
+        main_content_div = li_element.select_one('a[itemprop="item"] > div:nth-child(2)')
+        if not main_content_div:
+            # Fallback: tìm div có chứa h3
+            main_content_div = li_element.find('div', lambda value: value and li_element.find('h3'))
+            if not main_content_div:
+                main_content_div = li_element
+        
+        # Title - tìm h3 (thường là element đầu tiên trong content)
+        title_elem = main_content_div.find('h3')
+        if title_elem:
+            property_data['title'] = title_elem.get_text(strip=True)
+        
+        # Property type - tìm span đầu tiên sau h3
+        spans_in_content = main_content_div.find_all('span', recursive=False)
+        if len(spans_in_content) >= 1:
+            type_text = spans_in_content[0].get_text(strip=True)
+            property_data['property_type'] = type_text
+            # Extract bedrooms/bathrooms nếu có trong text
+            if 'phòng ngủ' in type_text.lower():
+                bedrooms_match = re.search(r'(\d+)\s*phòng ngủ', type_text, re.I)
+                if bedrooms_match:
+                    property_data['bedrooms'] = bedrooms_match.group(1)
+            if 'phòng tắm' in type_text.lower() or 'wc' in type_text.lower():
+                bathrooms_match = re.search(r'(\d+)\s*(?:phòng tắm|wc)', type_text, re.I)
+                if bathrooms_match:
+                    property_data['bathrooms'] = bathrooms_match.group(1)
+        
+        # Price và Area - tìm div chứa price info (thường là div thứ 2-3 trong content)
+        price_div = main_content_div.find('div', lambda value: value and main_content_div.find('div').find_all('span'))
+        
+        if price_div:
+            price_spans = price_div.find_all('span')
+            for i, span in enumerate(price_spans):
+                text = span.get_text(strip=True)
+                style = span.get('style', '')
+                
+                # Price - thường là span đầu tiên hoặc span có màu đỏ
+                if not property_data['price'] and (
+                    i == 0 or 
+                    'rgb(229, 25, 59)' in style or 
+                    any(keyword in text.lower() for keyword in ['tỷ', 'triệu', 'đồng', 'vnd'])
+                ):
+                    property_data['price'] = text
+                
+                # Area - tìm span chứa m²
+                if not property_data['area'] and ('m²' in text or 'm2' in text):
+                    property_data['area'] = text
+        
+        # Location và posted date - tìm span cuối cùng trong content (thường chứa location • date)
+        location_span = None
+        all_spans = main_content_div.find_all('span')
+        # Tìm span cuối cùng có chứa dấu •
+        for span in reversed(all_spans):
+            if '•' in span.get_text():
+                location_span = span
                 break
-            container = parent
         
-        # Title - thử nhiều selector
-        title_selectors = [
-            'h3', 'h2', 'h4', 'h5',
-            '[class*="title"]', '[class*="heading"]', 
-            '[class*="subject"]', '[class*="name"]'
-        ]
+        if location_span:
+            location_text = location_span.get_text(strip=True)
+            # Split by • để tách location và date
+            parts = [part.strip() for part in location_text.split('•')]
+            if len(parts) >= 1:
+                property_data['location'] = parts[0]
+            if len(parts) >= 2:
+                property_data['posted_date'] = parts[1]
         
-        for selector in title_selectors:
-            title_elem = container.select_one(selector)
-            if title_elem and title_elem.get_text(strip=True):
-                property_data['title'] = title_elem.get_text(strip=True)
-                break
+        # URL - tìm link chính
+        link_elem = li_element.find('a', {'itemprop': 'item'})
+        if not link_elem:
+            link_elem = li_element.find('a', href=True)
         
-        # Nếu không tìm được title, thử tìm text trong links
-        if not property_data['title']:
-            link_elem = container.find('a')
-            if link_elem:
-                property_data['title'] = link_elem.get_text(strip=True)
-        
-        # Price - tìm text chứa tiền
-        price_patterns = [r'.*tỷ.*', r'.*triệu.*', r'.*đồng.*', r'.*VND.*', r'.*million.*']
-        for pattern in price_patterns:
-            price_elem = container.find(text=re.compile(pattern, re.I))
-            if price_elem:
-                property_data['price'] = price_elem.strip()
-                break
-        
-        # Nếu không tìm được, thử tìm trong span/div có class chứa price
-        if not property_data['price']:
-            price_elem = container.find(['span', 'div'], class_=re.compile(r'.*price.*|.*gia.*', re.I))
-            if price_elem:
-                property_data['price'] = price_elem.get_text(strip=True)
-        
-        # Area - tìm text chứa m²
-        area_elem = container.find(text=re.compile(r'.*m².*|.*m2.*|.*diện tích.*', re.I))
-        if area_elem:
-            property_data['area'] = area_elem.strip()
-        
-        # Location - tìm địa chỉ
-        location_selectors = [
-            '[class*="location"]', '[class*="address"]', 
-            '[class*="dia-chi"]', '[class*="diadiem"]'
-        ]
-        for selector in location_selectors:
-            location_elem = container.select_one(selector)
-            if location_elem:
-                property_data['location'] = location_elem.get_text(strip=True)
-                break
-        
-        # URL
-        link_elem = container.find('a', href=True)
         if link_elem:
-            href = link_elem['href']
+            href = link_elem.get('href', '')
             if href.startswith('/'):
                 property_data['url'] = f"https://www.nhatot.com{href}"
             elif not href.startswith('http'):
@@ -330,10 +312,15 @@ class NhatotRealEstateCrawler:
             else:
                 property_data['url'] = href
         
-        # Image URL
-        img_elem = container.find('img', src=True)
+        # Image URL - tìm img đầu tiên
+        img_elem = li_element.find('img', src=True)
         if img_elem:
-            src = img_elem['src']
+            src = img_elem.get('src', '')
+            alt = img_elem.get('alt', '')
+            # Sử dụng alt làm description nếu có
+            if alt and not property_data.get('description'):
+                property_data['description'] = alt
+                
             if src.startswith('//'):
                 property_data['image_url'] = f"https:{src}"
             elif src.startswith('/'):
